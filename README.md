@@ -21,6 +21,7 @@
 - **译审术语对照表（本轮新增）**：译审按**目标语言**维护「源词 → 规定译法」对照表，**整表修改**（整体替换词条）并携带读取时**术语版本**（未配置传 `0`），过期返回 `409` 与当前表；词与译法均为**非空文本**（无首尾空白、≤100 字），**同一语言源词不得重复**，允许提交空数组清空该语言术语。按**当前原文字幕文本精确匹配**源词（字面子串）：每条命中源词的译文都**必须包含对应规定译法**，**一行命中多词时每个规定译法都须满足**；**未配置术语的语言完全不受影响**。另有只读缺失查询，按**语言、字幕 ID 与源词**逐条列出缺失译法并附当前术语版本（无译文行也列出）。**译文即使缺失规定译法仍可保存供修正**（保存响应与并列视图附 `term_issues`），**术语变更不改变既有译文的 current/review 状态**。**单语言译文导出、多语言同版交付与译文署名版导出**在**原有事务内读取当前术语**并核对：任一缺失逐行（多语交付按语言+行，署名导出行内带 `translation_term_missing`）报错且**不生成快照、不消耗版本**；**原文导出、现有译文读写约定与旧导出快照保持兼容**（术语收紧后旧快照仍可下载且内容不变）。
 - **重排后历史译文找回（本轮新增）**：重排删除源行后，译文按既有约定留作**历史**（绝不按序号自动挪用）。校对者可先按语言查询当前**缺译行**的历史候选及**匹配依据**（只读）：只有与当前行属于**同一次逐词导入**（导入代次 `import_version` 一致）且**词区间**与**源字幕文本**均一致的候选**可恢复**；**重新导入前的旧代次历史**、**无法确认导入归属的旧库历史**（`src_import_id` 为空）同样列出但只能查看、不能恢复。恢复请求携带读取时**字幕集版本** `sub_version`、**规则版本** `rules_version`、**目标行**及**候选译文 ID + 版本**，可一次选择多行；服务端在**同一事务内**重新核对目标仍缺译、候选三要素仍匹配以及候选文本满足**现行字数/字速**规则，任一失效都**按行说明原因且整组不写**。成功后为每行写成一条**普通 current 译文**（新版本从 1 开始），**原历史记录保留不改**、**不推进 `sub_version`**、**旧导出快照不变**；术语缺失仍按现有译文视图 `term_issues` 提示并继续阻止导出；恢复出的译文可继续使用逐行保存/确认、整批回填、单语言导出与多语交付等既有操作。
 - **两批交付差异对照（本轮新增，只读）**：片方审阅同一项目两次交付的实际字幕差异时，输入**基准批次**与**目标批次** ID（`GET …/deliveries/diff?base_id=&target_id=`），返回**原文及两批语言并集**的对照。只在一侧出现的语言标**新增（added）/移除（removed）**；双方都有的文件以各自**冻结的 WebVTT** 为准，按字幕**起止时间构成的区段**比较**实际显示文本**，列出差异区段的**起止毫秒、两侧文本与对应文件版本**：**拆分、合并或整体移时按时间区段自然对齐，绝不按行号配对**；时间空档记 `null`、空白字幕记 `""`，**空白与字幕的转换不漏报**；相邻差异区段在两侧各自文本跨边界均未变时**合并**。文件快照完好时，**同批比较返回空差异**。批次**不存在或不属于该项目时明确拒绝**；任一文件**快照缺失或格式损坏**（签名/时间戳/时间轴/cue 数不符）时指出**批次和文件**，**整份报告失败、不返回部分结果**。查询**只读**，不受当前字幕、译文或术语修改影响，原有交付与下载约定保持兼容。
+- **片方交付返修意见（本轮新增）**：片方收到多语交付后，可对**某批次的原文或指定语言冻结文件**按**起止毫秒**记录**非空返修意见**；区间必须落在该文件**冻结时间轴**内（首 cue 起 .. 末 cue 止），创建时记录**命中的冻结文本与时间**（cue 原文、原始起止与区间内相交起止；全部落在空档时命中为空，仍可返修）。对**同项目后续目标批次**核对时只按**两份冻结文件的时间区段**比较：目标批次**未交付所选语言**记**无法核对（unavailable）**，**区间内文本和覆盖范围均未变**记**未改动（unchanged）**，其余（文本变化、覆盖增减、时间轴平移/缩短等）记**待人工确认（manual）**——**不能由当前编辑稿或词序自动判定已修复**，核对全程只读两份冻结快照。片方仅可对**待人工确认**项显式判为**已解决（resolved）/仍待修（outstanding）**，结论**绑定该目标批次**；换批核对时旧批次结论**仅作历史**、不挪用到新批次。下结论携带**意见版本**（乐观锁）：过期返回当前自动结果与结论且不修改；同目标批次同结论重复提交幂等返回。**批次不存在、跨项目、清单所指文件缺失或快照损坏、区间越界一律明确拒绝且不改意见**。原有交付与下载行为维持不变。
 - **逐词区间复核意见（本轮新增）**：校对页管理锚定**逐词区间**的复核意见。校对者以**当前导入代次 `import_version`、字幕集版本 `sub_version`、起止词序与非空意见**创建记录，区间须落在现有逐词转写内；列表逐条返回**意见状态、词段与相交的当前字幕**。意见锚定**导入代次 + 词序**：重排拆并、逐词改时及字幕行更替后仍显示在相交字幕旁，**不按字幕 ID 或行号迁移**。**关闭**时须有相交的当前字幕，并保存其**文本、时间与词区间快照**；其后这些内容变化则自动转**待复核**，直到再次显式关闭；**锁定或仅展示顺序变化不触发**。**重新导入**后旧意见仅作**历史**查看，不附到新词段且不可关闭/重开。意见写入携带**意见版本**，创建或写入所带版本过期均返回当前值且不修改。页面支持查看、创建、关闭与重新打开。
 
 ## 启动
@@ -77,6 +78,7 @@ Compose 默认把 SQLite 挂到命名卷 `subtitle-data` 持久化（含所有�
 13. **重排后历史译文找回（本轮新增）**：重排后出现缺译行时，`GET …/translations/:lang/recovery-candidates` 查看每行历史候选与匹配依据；只有**同一次逐词导入**（`import_version` 一致）且**词区间、源字幕文本均一致**的候选可恢复（重新导入留下的旧代次历史、归属未知的旧历史仅供查看）。`POST …/translations/:lang/recover` 携带 `{sub_version, rules_version, items:[{subtitle_id, cue_version, translation_id, version}]}` 一次可恢复多行，事务内重核目标仍缺译、候选匹配与现行字数/字速，任一失效按行说明且整组不写；成功写成普通 current 译文（新译文版本从 1 开始），历史记录与旧导出快照不改、不推进 `sub_version`，术语缺失仍提示并阻止导出。HTTP 流程见 `examples/translation-recovery-api.sh`。
 14. **片方审阅两批交付差异（本轮新增，只读）**：`GET /api/projects/:id/deliveries/diff?base_id=<批次>&target_id=<批次>` 输入同一项目两个交付批次，以各自**冻结 WebVTT** 按字幕起止时间区段比较实际显示文本，返回原文及两批语言并集的对照：单侧语言标 `added`/`removed`；双方都有的文件列出差异区段起止毫秒、两侧文本（空档 `null`、空白字幕 `""`）与各自文件版本；拆分/合并/整体移时按时间对齐不按行号配对，相邻且两侧文本均未变的区段合并；同批比较返回空差异。批次不存在或不属于项目明确拒绝（`404`）；快照缺失/格式损坏指出批次与文件、整份报告失败不返回部分结果（`500`）。查询只读，不受当前字幕、译文或术语修改影响，旧交付与下载约定保持兼容。HTTP 流程见 `examples/delivery-diff-api.sh`。
 15. **逐词区间复核意见（本轮新增）**：在左侧 ⑨ 面板填起止词序与意见「创建意见」（自动携带当前导入代次与字幕集版本），右侧「复核意见（逐词区间）」面板逐条查看状态、词段与相交的当前字幕，可「✓ 关闭」（保存相交字幕快照）或「↩ 重新打开」；相交字幕的文本/时间/词区间再变化时意见自动转**待复核**，核对后再次关闭即可。HTTP 流程见 `examples/comments-api.sh`。
+16. **片方交付返修意见（本轮新增）**：片方对某批次的原文或指定语言冻结文件，按起止毫秒 `POST …/deliveries/:bid/delivery-comments` 记录非空返修意见（区间落在文件时间轴内，响应给出命中的冻结文本与时间）；对同项目后续批次用 `GET …/delivery-comments/:dcid/check?target_id=` 只读核对两份冻结快照——未交付语言「无法核对」、区间内文本与覆盖均未变「未改动」、其余「待人工确认」（不能由编辑稿/词序自动判修复）；仅待人工确认项可 `POST …/delivery-comments/:dcid/decisions?target_id=` 携带意见版本判「已解决/仍待修」，结论绑定目标批次、换批仅作历史，过期 `409` 返回当前状态。HTTP 流程见 `examples/delivery-comments-api.sh`。
 
 ## API 摘要
 
@@ -117,6 +119,12 @@ Compose 默认把 SQLite 挂到命名卷 `subtitle-data` 持久化（含所有�
 | `GET` | `/api/projects/:id/deliveries` | 交付批次清单（倒序，含每批文件清单、字幕集/规则版本） |
 | `GET` | `/api/projects/:id/deliveries/:bid` | 单个批次清单（文件序列版本与既有下载地址；正文走下载接口） |
 | `GET` | `/api/projects/:id/deliveries/diff?base_id=&target_id=` | **片方审阅：两批交付字幕差异对照（只读）**：以两批各自冻结的 WebVTT 为准按时间区段比较显示文本，语言取并集并标注新增/移除；参数非法 `400`、批次不存在或跨项目 `404`、快照缺失/格式损坏 `500`（指出批次与文件、整份报告失败不返回部分结果） |
+| `POST` | `/api/projects/:id/deliveries/:bid/delivery-comments` | **片方记录返修意见**：`{kind:'source'|'translation', lang?, start_ms, end_ms, text}`；锚定该批次原文或指定语言冻结文件的毫秒区间（落在文件时间轴内），返回命中的冻结文本与时间；形状非法 `400`、批次不存在/跨项目 `404`、未交付该语言 `422 file_not_delivered`、区间越界 `422 interval_out_of_timeline`、快照缺失/损坏 `500`（均不创建） |
+| `GET` | `/api/projects/:id/delivery-comments?batch_id=` | 返修意见清单（可按批次过滤；过滤参数非法 `400`、批次不存在/跨项目 `404`） |
+| `GET` | `/api/projects/:id/delivery-comments/:dcid` | 单条返修意见：锚定区间、命中冻结文本与各目标批次结论历史；不存在 `404` |
+| `GET` | `/api/projects/:id/delivery-comments/:dcid/check?target_id=` | **对后续目标批次核对（只读）**：只比较两份冻结文件区间 → `unavailable`（目标批次未交付所选语言，无法核对）/ `unchanged`（区间内文本和覆盖均未变，未改动）/ `manual`（待人工确认，列差异区段），附该目标批次当前结论；参数非法 `400`、意见/批次不存在或跨项目 `404`、快照缺失/损坏 `500` |
+| `GET` | `/api/projects/:id/deliveries/:bid/delivery-comments/check?base_id=` | **批次级核对（只读）**：一次返回来源批次全部意见对该目标批次的自动结果与结论；任一所涉冻结文件缺失/损坏 → `500` 整份报告失败（`snapshot_problems` 全量列出） |
+| `POST` | `/api/projects/:id/delivery-comments/:dcid/decisions?target_id=` | **对“待人工确认”项下显式结论**：`{version, verdict:'resolved'|'outstanding'}`，结论绑定目标批次并推进意见版本；同目标批次同结论幂等重放（不校验/推进版本）；形状非法 `400`、意见/批次不存在或跨项目 `404`、版本过期 `409`（带当前自动结果与结论）、自动结果非 manual（无法核对/未改动）`422`、快照问题 `500` |
 | `GET` | `/api/projects/:id/speakers` | 说话人名册：编号→显示名（附每条有效归属数）与当前 `attribution_version` |
 | `POST` | `/api/projects/:id/speakers` | 新建说话人：`{display_name}`（编号服务端分配、不回收；含换行/`<`/`>` → `400`） |
 | `PATCH` | `/api/projects/:id/speakers/:number` | 改显示名：`{attribution_version, display_name}`；改名推进归属版本，版本过期 → `409`，编号不存在 → `404` |
@@ -402,6 +410,62 @@ GET /api/projects/:id/deliveries/diff?base_id=<基准批次ID>&target_id=<目标
 
 完整 curl 示例：`examples/delivery-diff-api.sh`（连续两批交付（含语言新增/移除与文本修改）→ 对照并展示语言并集与时间区段差异（毫秒/文本/两侧版本）→ 同批比较空差异 → 参数非法/批次不存在/跨项目拒绝）。该接口**只读**：不改变任何批次、快照、当前字幕、译文或术语；既有交付与 `exports`/`translations/:lang/exports` 下载约定完全保持兼容。
 
+## 片方交付返修意见（冻结文件毫秒区间 → 后续批次核对 → 显式结论）
+
+片方收到多语交付后，针对**某个已交付批次**的**原文**或**指定语言冻结文件**，按**起止毫秒**记录非空返修意见；意见只锚定「批次 + 文件（kind/lang）+ 毫秒区间」。随后对**同一项目的后续目标批次**核对时，服务端只读取**两份冻结 WebVTT 快照**在该区间上的时间区段，不碰当前编辑稿、词序、译文或术语表——因此**不能由当前编辑稿或词序自动判定已修复**，核对结果可重复查询且不随后续编辑变化（只有显式结论会累积）。
+
+### 记录返修意见
+
+```
+POST /api/projects/:id/deliveries/:bid/delivery-comments
+{ "kind": "translation", "lang": "en", "start_ms": 0, "end_ms": 1000, "text": "这句语气请更自然" }
+```
+
+- `kind`：`source`（原文，无需 `lang`）或 `translation`（指定语言译文，`lang` 必填且须为批次已交付语言）。
+- `start_ms`/`end_ms`：**非负整数且起 < 止**；区间必须落在该文件**冻结时间轴** `[首 cue 起, 末 cue 止]` 内（越界 → `422 interval_out_of_timeline`，响应附 `timeline`）。
+- `text`：非空意见（自动去首尾空白，≤2000 字）。
+- 响应 `comment` 含意见 `id`、`version`（初始 1）、锚定区间（毫秒与 `HH:MM:SS.mmm`）与 **`hits`**——创建时**命中的冻结文本与时间**：每个与区间相交的 cue 给出 cue 全文、cue 原始起止（`cue_start_ms/cue_end_ms`）与相交截取起止（`clip_start_ms/clip_end_ms`）。区间全部落在两条 cue 之间的空档时 `hits` 为空数组（空档同样是返修对象）。
+- 拒绝（**均不创建意见**）：`400` 形状非法；`404` 批次不存在（`batch_not_found`）或跨项目（`batch_other_project`，指出实际所属项目）；`422` 批次未交付所选语言（`file_not_delivered`）或区间越界；`500` 清单所指文件缺失（`manifest_missing`）/清单指向未知导出序列（`manifest_corrupt`）/快照行不存在（`snapshot_missing`）/WebVTT 损坏或 cue 数不符（`snapshot_corrupt`）。
+
+### 对后续目标批次核对（只读）
+
+```
+GET /api/projects/:id/delivery-comments/:dcid/check?target_id=<目标批次ID>
+```
+
+只比较意见来源批次与目标批次**两份冻结文件**在 `[start_ms,end_ms)` 上的显示文本与覆盖（合并两侧 cue 边界切分极小区段；时间空档 `null` 与空文本 `""` 互不相等；相邻同文本差异区段合并）：
+
+| `auto.status` | 含义 | 条件 |
+|---|---|---|
+| `unavailable` | **无法核对** | 目标批次未交付所选语言（译文文件缺失；原文两批必有，不会出现） |
+| `unchanged` | **未改动** | 区间落在目标文件时间轴内，且区间内**文本和覆盖范围均未变** |
+| `manual` | **待人工确认** | 其余一切：文本变化、覆盖增减（出现/消除空档）、时间轴平移或缩短致区间越界等 |
+
+`manual` 时 `auto.differences[]` 逐段给出 `start_ms/end_ms`、`start/end` 与 `base_text/target_text`；响应还附两侧文件（版本与既有 `download_url`）、`interval`（含目标时间轴与 `within_target_timeline`）及该目标批次上的当前 `decision`（无则 `null`）。
+
+另有**批次级只读核对**：`GET /api/projects/:id/deliveries/:bid/delivery-comments/check?base_id=<意见来源批次>` 一次返回来源批次全部意见对该目标批次的自动结果（`summary` 给 total/unavailable/unchanged/manual 计数）与各自结论；任一所涉冻结文件缺失/损坏 → `500`，`snapshot_problems[]` 全量列出，**整份报告失败、不返回部分结果**（目标批次未交付某语言属正常 `unavailable`，不算快照问题）。
+
+### 片方显式结论（绑定目标批次，意见版本乐观锁）
+
+只有自动结果为 **`manual`（待人工确认）** 的项允许人工下结论：
+
+```
+POST /api/projects/:id/delivery-comments/:dcid/decisions?target_id=<目标批次ID>
+{ "version": 1, "verdict": "resolved" }      // resolved=已解决 / outstanding=仍待修
+```
+
+- `200` 写入：结论（`verdict`/`verdict_text`、`target_batch_id`、写入时意见版本）随响应返回，意见 `version` **+1**；单条意见视图 `GET …/delivery-comments/:dcid` 的 `decisions[]` 保留**各目标批次结论历史**，核对接口在对应目标批次下回显该结论。
+- **结论绑定目标批次**：对 A 批次的结论不会出现在 B 批次；换批核对时旧结论**仅作历史**，新批次须重新自动核对、重新下结论。
+- **幂等**：同目标批次同结论重复提交 → `200 replayed:true`，**不校验版本、不推进版本、不改时间**；改判另一结论须携带当前意见版本。
+- **并发**：写入携带意见 `version`；过期（含并发已推进）→ `409`，响应 `current` 给出当前意见、当前自动核对结果与该批次现有结论，**不修改**。
+- `422`：自动结果不是 `manual`（对**无法核对/未改动**目标下结论一律拒绝，附 `auto`）；`400` 形状非法；`404` 意见或目标批次不存在/跨项目；`500` 快照缺失或损坏。
+
+### 拒绝口径汇总（明确拒绝且不改意见）
+
+批次不存在、跨项目、清单所指文件缺失、快照损坏、区间越界五类情况在记录与核对/下结论链路上口径一致：`404`（不存在/跨项目，带 `reason_code` 与实际项目）、`422 interval_out_of_timeline`（记录时区间越界）、`422 file_not_delivered`（记录时语言未交付）、`500`（快照缺失/损坏，指出批次与文件；核对类接口不返回部分结果）。
+
+完整 curl 示例：`examples/delivery-comments-api.sh`（交付批次一 → 对英语冻结文件按毫秒区间记返修意见并展示命中冻结文本 → 同批自查“未改动” → 改译文交付批次二核对“待人工确认”并列差异区段 → 携带版本判“已解决”（含过期版本 `409`、幂等重放、改判）→ 换批旧结论仅作历史 → 改交其他语言的批次三“无法核对”且禁止下结论 → 批次级核对 → 形状非法/区间越界/未交付语言/批次不存在/跨项目/未改动项不得下结论等拒绝 → 既有下载内容不变）。返修功能只新增接口与两张表，**原有交付与下载行为完全维持**。
+
 
 ## 说话人标注与署名版导出（名册 → 按字幕 ID 归属 → 带标签不可变快照）
 
@@ -652,7 +716,7 @@ WEBVTT
 
 ```
 server.js            入口：初始化 SQLite、播种演示数据、启动 HTTP
-src/db.js            连接与建表（projects[含 sub_version/attribution_version/import_version]/words/shots/rules/subtitles/exports/revisions/revision_items/word_revisions/word_revision_items/translations[含 src_import_id]/translation_exports/delivery_batches/delivery_files/translation_batches/translation_batch_items/speakers/attributions/attributed_exports/glossaries/glossary_terms/review_comments；旧库迁移补 attribution_version/import_version/src_import_id）
+src/db.js            连接与建表（projects[含 sub_version/attribution_version/import_version]/words/shots/rules/subtitles/exports/revisions/revision_items/word_revisions/word_revision_items/translations[含 src_import_id]/translation_exports/delivery_batches/delivery_files/translation_batches/translation_batch_items/speakers/attributions/attributed_exports/glossaries/glossary_terms/review_comments/delivery_comments/delivery_comment_decisions；旧库迁移补 attribution_version/import_version/src_import_id）
 src/layout.js        排版引擎（纯函数）：切点分析 → 分段 → 定时 → 结构自检
 src/validate.js      导入与编辑校验
 src/revision.js      批量字幕修订提议：请求解析 + 整组候选核对（词区间/时间/切点/相邻/规则/版本）
@@ -661,6 +725,7 @@ src/translation.js   多语言译文字幕：解析/规则校验/并列视图/�
 src/translation-batch.js 译者整批译文回填：请求解析/内容指纹/事务内逐行版本与规则核对/幂等与批次清单
 src/delivery.js      片方多语交付批次：请求解析 + 事务内整版/逐语言逐行核对 + 批次清单视图
 src/delivery-diff.js 片方审阅两批交付差异（只读）：批次归属校验/冻结快照完整性预检/语言并集/区段对照报告组装
+src/delivery-comment.js 片方交付返修意见：请求解析/批次归属校验/冻结文件载入与时间轴校验/命中冻结文本/区间内两快照时间区段比较（unavailable/unchanged/manual）/结论视图
 src/speaker.js       说话人标注：名册/显示名校验/归属批量与单行乐观锁核对/删除行历史对账/署名版导出事务核对
 src/glossary.js      译审术语表：整表替换与乐观锁/词条校验（非空/同语言源词唯一）/源词精确匹配核对/缺失查询与导出/交付/署名导出的术语闸门
 src/translation-recovery.js 重排后历史译文找回：缺译行候选视图（同导入代次+词区间+源文三要素匹配依据）/组级恢复请求解析与事务内重核（目标仍缺译/候选失效/现行字数字速，整组原子）
@@ -675,10 +740,11 @@ examples/translations-api.sh 多语言译文字幕（保存→查询→失效/�
 examples/translation-batches-api.sh 译者整批译文回填（整批写入→幂等/冲突→过期/违规→覆盖待复核→下游读取）的完整 curl 调用示例
 examples/deliveries-api.sh 片方多语交付批次（核对→整批冻结→清单查询→既有接口下载）的完整 curl 调用示例
 examples/delivery-diff-api.sh 片方审阅两批交付差异（两批交付含语言增减→区段对照→同批空差异→参数/不存在/跨项目拒绝）的完整 curl 调用示例（只读）
+examples/delivery-comments-api.sh 片方交付返修意见（毫秒区间意见→命中冻结文本→后续批次无法核对/未改动/待人工确认核对→携带版本下已解决/仍待修结论→各类拒绝）的完整 curl 调用示例
 examples/speakers-api.sh 说话人标注与署名版导出（名册→归属→重排身份保持→原文/译文署名快照→兼容普通导出）的完整 curl 调用示例
 examples/glossaries-api.sh 译审术语对照表（建表/乐观锁→缺失查询→单语言导出/多语交付/译文署名导出三类闸门→旧快照兼容）的完整 curl 调用示例
 examples/translation-recovery-api.sh 重排后历史译文找回（候选查看与匹配依据→非法/漂移/错配拒绝→组级恢复→重新导入后旧历史不可恢复）的完整 curl 调用示例
 examples/comments-api.sh 逐词区间复核意见（创建→关闭快照→漂移待复核→重开/再关闭→重排锚定→重新导入历史）的完整 curl 调用示例
-test/                node:test 单元 + API 集成测试（revision / word-revision / translation / translation-batch / translation-recovery / delivery / delivery-diff / speaker / glossary / comment 覆盖十类流程）
+test/                node:test 单元 + API 集成测试（revision / word-revision / translation / translation-batch / translation-recovery / delivery / delivery-diff / delivery-comment / speaker / glossary / comment 覆盖十一类流程）
 Dockerfile / docker-compose.yml
 ```

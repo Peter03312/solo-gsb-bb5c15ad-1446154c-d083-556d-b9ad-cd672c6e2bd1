@@ -347,6 +347,55 @@ CREATE TABLE IF NOT EXISTS review_comments (
 );
 CREATE INDEX IF NOT EXISTS idx_review_comments_project
   ON review_comments(project_id, status);
+
+-- 片方交付返修意见：收到多语交付后，针对某交付批次的原文或某指定语言冻结文件，
+-- 按起止毫秒（文件时间轴内）记录非空返修意见。意见只锚定“批次 + 文件（kind/lang）
+-- + 毫秒区间”，并在创建时保存命中的冻结文本与时间（hits_json）；之后任何编辑、
+-- 重排、改译文都不影响旧批次与意见。
+--   kind        source（原文）/ translation（指定语言译文，lang 必填）
+--   version     意见版本（乐观锁）：对“待人工确认”项下结论必须携带，过期返回当前状态。
+-- 对同项目后续目标批次的核对完全基于两份冻结快照实时比较，不在本表存储核对结果；
+-- 片方的显式结论（已解决/仍待修）存于 delivery_comment_decisions，绑定目标批次。
+CREATE TABLE IF NOT EXISTS delivery_comments (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id   INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  batch_id     INTEGER NOT NULL REFERENCES delivery_batches(id) ON DELETE CASCADE,
+  kind         TEXT NOT NULL,                 -- source / translation
+  lang         TEXT,                          -- kind=translation 时为语言代号
+  start_ms     INTEGER NOT NULL,              -- 区间起（毫秒，闭区间，落在文件时间轴内）
+  end_ms       INTEGER NOT NULL,              -- 区间止（毫秒）
+  text         TEXT NOT NULL,                 -- 非空返修意见
+  version      INTEGER NOT NULL DEFAULT 1,    -- 意见版本（下结论携带，乐观锁）
+  hits_json    TEXT NOT NULL,                 -- 创建时命中的冻结文本与时间快照
+  created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_delivery_comments_project
+  ON delivery_comments(project_id, id);
+CREATE INDEX IF NOT EXISTS idx_delivery_comments_batch
+  ON delivery_comments(batch_id);
+
+-- 片方对“待人工确认”返修项的显式结论，绑定“意见 + 目标批次”：
+--   verdict     resolved（已解决）/ outstanding（仍待修）
+-- 目标批次未交付所选语言（无法核对）或区间内文本与覆盖均未变（未改动）时不得下结论。
+-- 同一意见对同一目标批次只有一条结论：重复提交相同结论幂等返回（不推进版本），
+-- 改写结论须携带当前意见版本（每次写结论推进 delivery_comments.version）。
+-- 换批核对时旧批次上的结论仅作历史，不影响新批次的自动核对。
+CREATE TABLE IF NOT EXISTS delivery_comment_decisions (
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id       INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  comment_id       INTEGER NOT NULL REFERENCES delivery_comments(id) ON DELETE CASCADE,
+  target_batch_id  INTEGER NOT NULL REFERENCES delivery_batches(id) ON DELETE CASCADE,
+  verdict          TEXT NOT NULL,             -- resolved / outstanding
+  comment_version  INTEGER NOT NULL,          -- 写入时所基于（并推进到）的意见版本
+  created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at       TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(comment_id, target_batch_id)
+);
+CREATE INDEX IF NOT EXISTS idx_delivery_decisions_project
+  ON delivery_comment_decisions(project_id, comment_id);
+CREATE INDEX IF NOT EXISTS idx_delivery_decisions_target
+  ON delivery_comment_decisions(target_batch_id);
 `;
 
 const DEFAULT_RULES = { max_chars: 30, min_duration_ms: 800, max_cps: 20 };

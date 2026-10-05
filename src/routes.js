@@ -18,6 +18,14 @@ const {
 } = require('./translation');
 const { parseDeliveryBody, evaluateDelivery, listBatches, loadBatch } = require('./delivery');
 const { buildDeliveryDiff, BatchDiffError } = require('./delivery-diff');
+const deliveryCommentMod = require('./delivery-comment');
+const {
+  parseDeliveryCommentBody, parseDecisionBody, DeliveryCommentError,
+  resolveBatch: resolveDeliveryBatch, loadFrozenFile: loadDeliveryFrozenFile,
+  timelineOf: deliveryTimelineOf, hitsInRange: deliveryHitsInRange,
+  checkComment: checkDeliveryComment, getDecision: getDeliveryDecision,
+  loadCommentView: loadDeliveryCommentView, listComments: listDeliveryComments,
+} = deliveryCommentMod;
 const {
   parseTranslationBatchBody, contentHash, evaluateBatch,
   listBatches: listTranslationBatches, loadBatch: loadTranslationBatch,
@@ -2352,6 +2360,384 @@ function createApp(db) {
     const batch = loadBatch(db, p.id, Number(req.params.bid));
     if (!batch) return res.status(404).json({ error: `交付批次 ${req.params.bid} 不存在` });
     res.json(batch);
+  });
+
+  // ---------- 片方交付返修意见（冻结文件毫秒区间意见 → 后续批次核对 → 显式结论） ----------
+  //
+  // 片方收到多语交付后，可对某批次的原文或指定语言冻结文件按起止毫秒记录非空返修意见，
+  // 区间须落在该文件冻结时间轴内，并记录命中的冻结文本与时间。对同项目后续目标批次
+  // 核对时只按两份冻结文件的时间区段比较：目标批次未交付所选语言记“无法核对”，
+  // 区间内文本和覆盖范围均未变记“未改动”，其余记“待人工确认”——不能由当前编辑稿或
+  // 词序自动判定已修复。片方仅可对“待人工确认”项显式判为“已解决/仍待修”，结论绑定
+  // 目标批次；换批后旧结论仅作历史。批次不存在、跨项目、清单所指文件缺失或快照损坏、
+  // 区间越界一律明确拒绝且不改意见；下结论携带意见版本，过期返回当前状态。
+
+  /**
+   * 返修意见清单（可按批次过滤）。
+   *   GET /api/projects/:id/delivery-comments?batch_id=<可选>
+   */
+  app.get('/api/projects/:id/delivery-comments', (req, res) => {
+    const p = getProject(req, res);
+    if (!p) return;
+    let batchId = null;
+    if (req.query.batch_id !== undefined) {
+      batchId = Number(req.query.batch_id);
+      if (!Number.isInteger(batchId) || batchId < 1) {
+        return res.status(400).json({ error: 'batch_id 查询参数必须是 ≥1 的整数批次 ID' });
+      }
+      const b = db.prepare('SELECT id, project_id FROM delivery_batches WHERE id = ?').get(batchId);
+      if (!b) return res.status(404).json({ error: `批次 ${batchId} 不存在` });
+      if (b.project_id !== p.id) {
+        return res.status(404).json({
+          error: `批次 ${batchId} 不属于项目 ${p.id}（属于项目 ${b.project_id}），拒绝跨项目查询`,
+          reason_code: 'batch_other_project',
+          batch_id: batchId,
+          actual_project_id: b.project_id,
+        });
+      }
+    }
+    res.json({ project_id: p.id, comments: listDeliveryComments(db, p.id, batchId) });
+  });
+
+  /** 单条返修意见（含命中冻结文本与各目标批次结论历史） */
+  app.get('/api/projects/:id/delivery-comments/:dcid', (req, res) => {
+    const p = getProject(req, res);
+    if (!p) return;
+    const view = loadDeliveryCommentView(db, p.id, Number(req.params.dcid));
+    if (!view) return res.status(404).json({ error: `返修意见 ${req.params.dcid} 不存在` });
+    res.json({ comment: view });
+  });
+
+  /**
+   * 创建返修意见（锚定某批次的原文或指定语言冻结文件的毫秒区间）。
+   *   { kind:'source'|'translation', lang?, start_ms, end_ms, text }
+   * 201 创建成功（附命中冻结文本与时间）；400 形状非法；
+   * 404 批次不存在/跨项目；422 批次未交付该语言文件或区间超出文件时间轴；
+   * 500 清单所指文件缺失/快照损坏（明确拒绝且不创建）。
+   */
+  app.post('/api/projects/:id/deliveries/:bid/delivery-comments', (req, res) => {
+    const p = getProject(req, res);
+    if (!p) return;
+
+    const parsed = parseDeliveryCommentBody(req.body);
+    if (!parsed.ok) {
+      return res.status(400).json({ error: '返修意见请求非法，未创建', errors: parsed.errors });
+    }
+    const it = parsed.item;
+
+    try {
+      // 批次存在性与同项目归属（全局 ID 解析，明确区分不存在与跨项目）
+      const batch = resolveDeliveryBatch(db, p.id, Number(req.params.bid), '交付批次');
+
+      // 载入并严格校验该文件冻结快照（缺失/损坏 → 500，整次操作失败不创建意见）。
+      // 译文“批次未交付所选语言”（清单行缺失）在下方 catch 中改判为业务拒绝 422。
+      const frozen = loadDeliveryFrozenFile(db, batch, it.kind, it.lang);
+      const timeline = deliveryTimelineOf(frozen.cues);
+
+      if (!timeline) {
+        return res.status(500).json({
+          error: `批次 ${batch.id} 的冻结文件时间轴为空（无 cue），快照可能已损坏，未创建意见`,
+        });
+      }
+      // 区间须落在文件时间轴内
+      if (it.start_ms < timeline.start_ms || it.end_ms > timeline.end_ms) {
+        return res.status(422).json({
+          error:
+            `时间区间 [${it.start_ms}, ${it.end_ms}] 超出文件冻结时间轴` +
+            ` [${timeline.start_ms}, ${timeline.end_ms}]，未创建返修意见`,
+          reason_code: 'interval_out_of_timeline',
+          timeline: {
+            start_ms: timeline.start_ms,
+            end_ms: timeline.end_ms,
+          },
+        });
+      }
+
+      // 记录命中的冻结文本与时间（空档区间命中为空数组，仍是合法返修对象）
+      const hits = deliveryHitsInRange(frozen.cues, it.start_ms, it.end_ms);
+      const cid = db.transaction(() => db.prepare(
+        `INSERT INTO delivery_comments
+           (project_id, batch_id, kind, lang, start_ms, end_ms, text, hits_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(p.id, batch.id, it.kind, it.lang, it.start_ms, it.end_ms,
+        it.text, JSON.stringify(hits)).lastInsertRowid)();
+
+      res.status(201).json({
+        comment: loadDeliveryCommentView(db, p.id, cid),
+        batch: { id: batch.id, note: batch.note },
+        file: deliveryCommentMod.fileRef(frozen.file),
+      });
+    } catch (err) {
+      if (err instanceof DeliveryCommentError) {
+        // 译文文件清单行不存在时 loadFrozenFile 按快照缺失处理（500）；
+        // “批次未交付所选语言”属于业务拒绝（422）。
+        if (err.statusCode === 500 && it.kind === 'translation' &&
+            err.payload && err.payload.reason_code === 'manifest_missing') {
+          return res.status(422).json({
+            error: `批次未交付语言 ${it.lang}，无法对该语言冻结文件记录返修意见`,
+            reason_code: 'file_not_delivered',
+            batch_id: err.payload.batch_id,
+          });
+        }
+        return res.status(err.statusCode).json(err.payload);
+      }
+      throw err;
+    }
+  });
+
+  /**
+   * 对一条返修意见核对同项目后续目标批次（只读两份冻结快照）。
+   *   GET /api/projects/:id/delivery-comments/:dcid/check?target_id=<目标批次>
+   * 200 返回 status：unavailable（无法核对）/ unchanged（未改动）/ manual（待人工确认），
+   * 附区间、差异区段与该目标批次上的当前结论；400 参数非法；404 意见/批次不存在或跨项目；
+   * 500 任一冻结文件缺失或损坏。核对不读当前编辑稿/词序，也不改任何意见或结论。
+   */
+  app.get('/api/projects/:id/delivery-comments/:dcid/check', (req, res) => {
+    const p = getProject(req, res);
+    if (!p) return;
+    const targetId = Number(req.query.target_id);
+    if (!Number.isInteger(targetId) || targetId < 1) {
+      return res.status(400).json({ error: 'target_id 查询参数必须是 ≥1 的整数目标批次 ID' });
+    }
+    const comment = db.prepare(
+      'SELECT * FROM delivery_comments WHERE id = ? AND project_id = ?'
+    ).get(Number(req.params.dcid), p.id);
+    if (!comment) return res.status(404).json({ error: `返修意见 ${req.params.dcid} 不存在` });
+    try {
+      const result = checkDeliveryComment(db, p.id, comment, targetId);
+      const decisionRow = getDeliveryDecision(db, comment.id, targetId);
+      res.json({
+        project_id: p.id,
+        comment_id: comment.id,
+        same_batch: comment.batch_id === targetId,
+        auto: result,
+        decision: decisionRow ? deliveryCommentMod.decisionView(decisionRow) : null,
+      });
+    } catch (err) {
+      if (err instanceof DeliveryCommentError) return res.status(err.statusCode).json(err.payload);
+      throw err;
+    }
+  });
+
+  /**
+   * 对某目标批次一次核对其批次（或全部）返修意见（只读）。
+   *   GET /api/projects/:id/deliveries/:bid/delivery-comments/check?base_id=<意见来源批次，必填>
+   * 仅核对 base_id 批次上的意见对本目标批次的自动结果；任一所涉冻结文件缺失/损坏 →
+   * 500 整份报告失败（snapshot_problems 全量列出，不返回部分结果）。
+   */
+  app.get('/api/projects/:id/deliveries/:bid/delivery-comments/check', (req, res) => {
+    const p = getProject(req, res);
+    if (!p) return;
+    const targetId = Number(req.params.bid);
+    const baseId = Number(req.query.base_id);
+    if (!Number.isInteger(baseId) || baseId < 1) {
+      return res.status(400).json({ error: 'base_id 查询参数必须是 ≥1 的整数意见来源批次 ID' });
+    }
+    try {
+      const targetBatch = resolveDeliveryBatch(db, p.id, targetId, '目标批次');
+      const baseBatch = resolveDeliveryBatch(db, p.id, baseId, '返修意见来源批次');
+      const comments = db.prepare(
+        'SELECT * FROM delivery_comments WHERE project_id = ? AND batch_id = ? ORDER BY id'
+      ).all(p.id, baseBatch.id);
+
+      // 预检：本次核对涉及的每个文件快照都必须存在且完好；任一问题整份报告失败。
+      // 目标批次未交付某语言属正常业务结果（unavailable），其清单行缺失不算快照问题。
+      const problems = [];
+      const inspect = (batch, file) => {
+        try {
+          return loadDeliveryFrozenFile(db, batch, file.kind, file.lang).cues;
+        } catch (err) {
+          if (err instanceof DeliveryCommentError && err.statusCode === 500) {
+            if (err.payload.reason_code === 'manifest_missing') return null;
+            problems.push(err.payload);
+            return null;
+          }
+          throw err;
+        }
+      };
+      const baseCache = new Map(); // kind:lang -> cues
+      for (const c of comments) {
+        const key = `${c.kind}:${c.lang ?? ''}`;
+        if (!baseCache.has(key)) {
+          baseCache.set(key, inspect(baseBatch, { kind: c.kind, lang: c.lang }));
+        }
+      }
+      // 目标侧只预检实际交付了的文件（未交付由逐项核对给 unavailable）
+      const targetCache = new Map();
+      for (const c of comments) {
+        const key = `${c.kind}:${c.lang ?? ''}`;
+        if (targetCache.has(key)) continue;
+        const targetFile = deliveryCommentMod.getBatchFile(db, targetBatch.id, c.kind, c.lang);
+        targetCache.set(key, targetFile ? inspect(targetBatch, targetFile) : undefined);
+      }
+      if (problems.length > 0) {
+        return res.status(500).json({
+          error:
+            `返修意见对批次 ${baseBatch.id} → ${targetBatch.id} 的核对因冻结文件问题整份失败` +
+            `（${problems.length} 处）：快照缺失或格式损坏，未返回任何核对结果`,
+          project_id: p.id,
+          base_id: baseBatch.id,
+          target_id: targetBatch.id,
+          snapshot_problems: problems,
+        });
+      }
+
+      const items = comments.map((c) => {
+        const result = checkDeliveryComment(db, p.id, c, targetId);
+        const decisionRow = getDeliveryDecision(db, c.id, targetId);
+        return {
+          comment_id: c.id,
+          kind: c.kind,
+          lang: c.lang,
+          interval: result.interval,
+          auto_status: result.status,
+          auto_status_text: result.status_text,
+          reason: result.reason,
+          differences: result.differences,
+          decision: decisionRow ? deliveryCommentMod.decisionView(decisionRow) : null,
+        };
+      });
+      res.json({
+        project_id: p.id,
+        base: { id: baseBatch.id, note: baseBatch.note },
+        target: { id: targetBatch.id, note: targetBatch.note },
+        same_batch: baseBatch.id === targetBatch.id,
+        summary: {
+          total: items.length,
+          unavailable: items.filter((i) => i.auto_status === 'unavailable').length,
+          unchanged: items.filter((i) => i.auto_status === 'unchanged').length,
+          manual: items.filter((i) => i.auto_status === 'manual').length,
+        },
+        items,
+      });
+    } catch (err) {
+      if (err instanceof DeliveryCommentError) return res.status(err.statusCode).json(err.payload);
+      throw err;
+    }
+  });
+
+  /**
+   * 对“待人工确认”项显式下结论（已解决 / 仍待修），结论绑定该目标批次。
+   *   POST /api/projects/:id/delivery-comments/:dcid/decisions?target_id=<目标批次>
+   *   { version, verdict }
+   * 200 写入成功（同目标批次同结论幂等重放也 200，不推进版本）；400 形状非法；
+   * 404 意见/目标批次不存在或跨项目；409 意见版本过期（带当前状态，不修改）；
+   * 422 自动核对不是“待人工确认”（无法核对/未改动不得下结论）；500 快照缺失/损坏。
+   */
+  app.post('/api/projects/:id/delivery-comments/:dcid/decisions', (req, res) => {
+    const p = getProject(req, res);
+    if (!p) return;
+    const targetId = Number(req.query.target_id);
+    if (!Number.isInteger(targetId) || targetId < 1) {
+      return res.status(400).json({ error: 'target_id 查询参数必须是 ≥1 的整数目标批次 ID' });
+    }
+    const parsed = parseDecisionBody(req.body);
+    if (!parsed.ok) {
+      return res.status(400).json({ error: '结论请求非法，未修改', errors: parsed.errors });
+    }
+
+    const comment = db.prepare(
+      'SELECT * FROM delivery_comments WHERE id = ? AND project_id = ?'
+    ).get(Number(req.params.dcid), p.id);
+    if (!comment) return res.status(404).json({ error: `返修意见 ${req.params.dcid} 不存在` });
+
+    let check;
+    try {
+      check = checkDeliveryComment(db, p.id, comment, targetId);
+    } catch (err) {
+      if (err instanceof DeliveryCommentError) return res.status(err.statusCode).json(err.payload);
+      throw err;
+    }
+    if (check.status !== 'manual') {
+      return res.status(422).json({
+        error:
+          `返修意见 ${comment.id} 对目标批次 ${targetId} 的自动核对结果为“${check.status_text}”，` +
+          '只有“待人工确认”项可由片方显式下结论；未修改任何结论',
+        auto: check,
+      });
+    }
+
+    const existing = getDeliveryDecision(db, comment.id, targetId);
+    // 同目标批次同结论幂等重放：不校验版本、不推进版本、不改时间
+    if (existing && existing.verdict === parsed.verdict) {
+      return res.json({
+        replayed: true,
+        comment_id: comment.id,
+        target_batch_id: targetId,
+        auto: check,
+        decision: deliveryCommentMod.decisionView(existing),
+        comment: loadDeliveryCommentView(db, p.id, comment.id),
+      });
+    }
+
+    try {
+      db.transaction(() => {
+        if (existing) {
+          const info = db.prepare(
+            `UPDATE delivery_comment_decisions
+                SET verdict = ?, comment_version = ?, updated_at = datetime('now')
+              WHERE id = ? AND comment_version = ?`
+          ).run(parsed.verdict, parsed.version + 1, existing.id, parsed.version);
+          if (info.changes !== 1) {
+            throw new DeliveryCommentError(409, {
+              error: `返修意见 ${comment.id} 版本过期：你基于 v${parsed.version} 操作，当前已是 v${comment.version}，请刷新后重试`,
+              current: {
+                comment: loadDeliveryCommentView(db, p.id, comment.id),
+                auto: check,
+                decision: deliveryCommentMod.decisionView(
+                  getDeliveryDecision(db, comment.id, targetId)
+                ),
+              },
+            });
+          }
+        } else {
+          // 插入同样携带意见版本乐观锁：并发首写以 UNIQUE(comment_id,target_batch_id) 兜底
+          const info = db.prepare(
+            `INSERT INTO delivery_comment_decisions
+               (project_id, comment_id, target_batch_id, verdict, comment_version)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(comment_id, target_batch_id) DO NOTHING`
+          ).run(p.id, comment.id, targetId, parsed.verdict, parsed.version + 1);
+          if (info.changes !== 1) {
+            throw new DeliveryCommentError(409, {
+              error: `返修意见 ${comment.id} 在目标批次 ${targetId} 上已被并发写入结论，请刷新后重试`,
+              current: {
+                comment: loadDeliveryCommentView(db, p.id, comment.id),
+                auto: check,
+                decision: deliveryCommentMod.decisionView(
+                  getDeliveryDecision(db, comment.id, targetId)
+                ),
+              },
+            });
+          }
+        }
+        // 每次（非幂等）写入推进意见版本
+        const bumped = db.prepare(
+          'UPDATE delivery_comments SET version = version + 1, updated_at = datetime(\'now\') WHERE id = ? AND version = ?'
+        ).run(comment.id, parsed.version);
+        if (bumped.changes !== 1) {
+          throw new DeliveryCommentError(409, {
+            error: `返修意见 ${comment.id} 版本过期：你基于 v${parsed.version} 操作，当前已是 v${comment.version}，请刷新后重试`,
+            current: {
+              comment: loadDeliveryCommentView(db, p.id, comment.id),
+              auto: check,
+            },
+          });
+        }
+      })();
+    } catch (err) {
+      if (err instanceof DeliveryCommentError) return res.status(err.statusCode).json(err.payload);
+      throw err;
+    }
+
+    res.json({
+      replayed: false,
+      comment_id: comment.id,
+      target_batch_id: targetId,
+      auto: check,
+      decision: deliveryCommentMod.decisionView(getDeliveryDecision(db, comment.id, targetId)),
+      comment: loadDeliveryCommentView(db, p.id, comment.id),
+    });
   });
 
   // ---------- 逐词区间复核意见（校对页） ----------
