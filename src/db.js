@@ -347,6 +347,44 @@ CREATE TABLE IF NOT EXISTS review_comments (
 );
 CREATE INDEX IF NOT EXISTS idx_review_comments_project
   ON review_comments(project_id, status);
+
+-- 片方返修意见：锚定“交付批次 + 冻结文件（原文/指定语言）+ 起止毫秒区间”。
+-- 区间须落在冻结文件时间轴内；创建时记录命中的冻结文本与时间（hits_json）及文件版本。
+-- 对同项目后续目标批次核对时只比较两份冻结文件（绝不读取当前编辑稿或词序）：
+--   目标批次未交付所选语言 → 无法核对；区间内文本与覆盖范围均未变 → 未改动；
+--   其余 → 待人工确认（系统不自动判定已修复）。
+-- 意见版本 version 为行级乐观锁：判定（结论）写入必须携带读取时的版本，过期返回当前状态。
+CREATE TABLE IF NOT EXISTS rework_comments (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id     INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  batch_id       INTEGER NOT NULL REFERENCES delivery_batches(id) ON DELETE CASCADE,
+  kind           TEXT NOT NULL,              -- source（原文文件）/ translation（指定语言译文文件）
+  lang           TEXT,                       -- kind=translation 时为语言代号；原文为 NULL
+  start_ms       INTEGER NOT NULL,           -- 返修区间 [start_ms, end_ms)（冻结文件时间轴内）
+  end_ms         INTEGER NOT NULL,
+  text           TEXT NOT NULL,              -- 非空返修意见
+  version        INTEGER NOT NULL DEFAULT 1, -- 意见版本（判定携带，乐观锁）
+  file_version   INTEGER NOT NULL,           -- 创建时冻结文件在其导出序列上的版本
+  hits_json      TEXT NOT NULL,              -- 创建时命中的冻结文本与时间 [{start_ms,end_ms,text}]
+  created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at     TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_rework_comments_batch
+  ON rework_comments(batch_id, id);
+CREATE INDEX IF NOT EXISTS idx_rework_comments_project
+  ON rework_comments(project_id, id);
+
+-- 返修判定结论：片方对“待人工确认”项显式判为 已解决(resolved) / 仍待修(still_pending)。
+-- 结论绑定目标批次（每意见每目标批次至多一条）；换批核对时旧批次结论仅作历史。
+CREATE TABLE IF NOT EXISTS rework_verdicts (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  comment_id      INTEGER NOT NULL REFERENCES rework_comments(id) ON DELETE CASCADE,
+  target_batch_id INTEGER NOT NULL REFERENCES delivery_batches(id) ON DELETE CASCADE,
+  verdict         TEXT NOT NULL,             -- resolved（已解决）/ still_pending（仍待修）
+  created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(comment_id, target_batch_id)
+);
 `;
 
 const DEFAULT_RULES = { max_chars: 30, min_duration_ms: 800, max_cps: 20 };

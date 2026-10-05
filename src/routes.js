@@ -42,6 +42,15 @@ const {
   parseCommentBody, parseVersionBody, syncComments, buildCommentsView,
   getComment, loadCommentView, intersectingSubtitles, snapshotOf,
 } = require('./comment');
+const {
+  ReworkError, resolveBatch, findFile, loadFileCues, timelineOf, hitsInInterval,
+  parseCreateBody: parseReworkCreateBody, parseVerdictBody: parseReworkVerdictBody,
+  commentView: reworkCommentView, getComment: getReworkComment,
+  commentStateView: reworkCommentStateView, inspectCommentFiles, evaluateComment,
+  commentCheckItem, buildCheckReport: buildReworkCheckReport,
+  buildCommentsList: buildReworkCommentsList, batchSummary: reworkBatchSummary,
+  fileLabel: reworkFileLabel, fileRef: reworkFileRef, toIntId: toReworkIntId,
+} = require('./rework');
 const { toWebVtt } = require('./vtt');
 
 /**
@@ -2352,6 +2361,207 @@ function createApp(db) {
     const batch = loadBatch(db, p.id, Number(req.params.bid));
     if (!batch) return res.status(404).json({ error: `交付批次 ${req.params.bid} 不存在` });
     res.json(batch);
+  });
+
+  // ---------- 片方返修意见（批次冻结文件 → 区间核对 → 人工判定） ----------
+  //
+  // 片方收到多语交付后，对某批次的原文或指定语言冻结文件按起止毫秒记录非空返修意见；
+  // 区间须落在冻结文件时间轴内，创建时记录命中的冻结文本与时间。对同项目后续目标批次
+  // 核对时只比较两份冻结文件的时间区段（绝不读取当前编辑稿或词序）：目标批次未交付所选
+  // 语言记“无法核对”，区间内文本与覆盖范围均未变记“未改动”，其余记“待人工确认”。
+  // 片方可对“待人工确认”项显式判为“已解决”/“仍待修”，结论绑定该目标批次，换批后旧
+  // 结论仅作历史。批次不存在/跨项目/清单所指文件缺失或快照损坏/区间越界时明确拒绝且不
+  // 改意见；判定携带意见版本（乐观锁），过期返回当前状态。原有交付与下载行为保持兼容。
+
+  /**
+   * 记录返修意见。
+   *   POST /api/projects/:id/deliveries/:bid/rework-comments
+   *   { kind:'source' } 或 { kind:'translation', lang }，加 { start_ms, end_ms, text }
+   * 201 创建成功（含命中的冻结文本与时间）；400 形状非法；404 批次不存在/跨项目/批次
+   * 未交付该语言文件；422 区间越出冻结文件时间轴；500 清单所指文件缺失或快照损坏。
+   */
+  app.post('/api/projects/:id/deliveries/:bid/rework-comments', (req, res) => {
+    const p = getProject(req, res);
+    if (!p) return;
+    const parsed = parseReworkCreateBody(req.body);
+    if (!parsed.ok) {
+      return res.status(400).json({ error: '返修意见请求非法，未创建', errors: parsed.errors });
+    }
+    const it = parsed.item;
+    try {
+      const created = db.transaction(() => {
+        const batch = resolveBatch(db, p.id, req.params.bid, 'base');
+        const file = findFile(db, batch.id, it.kind, it.lang);
+        if (!file) {
+          throw new ReworkError(404, {
+            error: `批次 ${batch.id} 未交付${reworkFileLabel(it.kind, it.lang)}，没有可锚定的冻结文件，未创建`,
+            reason_code: 'file_not_in_batch',
+            batch_id: batch.id,
+            kind: it.kind,
+            lang: it.lang,
+          });
+        }
+        const snap = loadFileCues(db, file);
+        if (!snap.ok) {
+          throw new ReworkError(500, {
+            error: `批次 ${batch.id} ${reworkFileLabel(it.kind, it.lang)}的冻结快照不可用，未创建返修意见`,
+            batch_id: batch.id,
+            snapshot_problems: [{
+              side: 'base', batch_id: batch.id, file: reworkFileRef(file),
+              problem: snap.problem, reason: snap.reason,
+            }],
+          });
+        }
+        const timeline = timelineOf(snap.cues);
+        if (!timeline || it.start_ms < timeline.start_ms || it.end_ms > timeline.end_ms) {
+          throw new ReworkError(422, {
+            error: timeline
+              ? `返修区间 [${it.start_ms}, ${it.end_ms}]ms 超出冻结文件时间轴 ` +
+                `[${timeline.start_ms}, ${timeline.end_ms}]ms，未创建`
+              : `批次 ${batch.id} ${reworkFileLabel(it.kind, it.lang)}没有任何字幕` +
+                '（时间轴为空），无法锚定返修区间，未创建',
+            reason_code: 'interval_out_of_timeline',
+            batch_id: batch.id,
+            file: reworkFileRef(file),
+            timeline,
+          });
+        }
+        const hits = hitsInInterval(snap.cues, it.start_ms, it.end_ms);
+        const cid = db.prepare(
+          `INSERT INTO rework_comments
+             (project_id, batch_id, kind, lang, start_ms, end_ms, text, file_version, hits_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ).run(p.id, batch.id, it.kind, it.lang, it.start_ms, it.end_ms, it.text,
+          file.version, JSON.stringify(hits)).lastInsertRowid;
+        return { batch, cid };
+      })();
+      res.status(201).json({
+        project_id: p.id,
+        batch: reworkBatchSummary(created.batch),
+        comment: reworkCommentView(getReworkComment(db, created.batch.id, created.cid)),
+      });
+    } catch (err) {
+      if (err instanceof ReworkError) return res.status(err.statusCode).json(err.payload);
+      throw err;
+    }
+  });
+
+  /** 批次返修意见列表（只读）：区间、命中快照、意见版本与全部判定结论 */
+  app.get('/api/projects/:id/deliveries/:bid/rework-comments', (req, res) => {
+    const p = getProject(req, res);
+    if (!p) return;
+    try {
+      const batch = resolveBatch(db, p.id, req.params.bid, 'base');
+      res.json(buildReworkCommentsList(db, p.id, batch));
+    } catch (err) {
+      if (err instanceof ReworkError) return res.status(err.statusCode).json(err.payload);
+      throw err;
+    }
+  });
+
+  /**
+   * 对同项目后续目标批次核对（只读）。
+   *   GET /api/projects/:id/deliveries/:bid/rework-comments/check?target_id=<目标批次>
+   * 按两份冻结文件的时间区段比较：无法核对 / 未改动 / 待人工确认；附该目标批次上的
+   * 当前结论与旧批次结论（历史）。400 参数非法；404 批次不存在/跨项目；
+   * 500 清单所指文件缺失或快照损坏（整份失败，不返回部分结果）。
+   */
+  app.get('/api/projects/:id/deliveries/:bid/rework-comments/check', (req, res) => {
+    const p = getProject(req, res);
+    if (!p) return;
+    try {
+      res.json(buildReworkCheckReport(db, p.id, req.params.bid, req.query.target_id));
+    } catch (err) {
+      if (err instanceof ReworkError) return res.status(err.statusCode).json(err.payload);
+      throw err;
+    }
+  });
+
+  /**
+   * 判定“待人工确认”项。
+   *   POST /api/projects/:id/deliveries/:bid/rework-comments/:cid/verdict
+   *   { version, target_batch_id, verdict: 'resolved'|'still_pending' }
+   * 结论绑定目标批次（同批重复判定覆盖结论），意见版本 +1。200 判定成功；
+   * 400 形状非法；404 意见/批次不存在或跨项目；409 意见版本过期（返回当前状态）；
+   * 422 核对结果不是“待人工确认”（无法核对/未改动不可判定）；500 快照问题。
+   */
+  app.post('/api/projects/:id/deliveries/:bid/rework-comments/:cid/verdict', (req, res) => {
+    const p = getProject(req, res);
+    if (!p) return;
+    const parsed = parseReworkVerdictBody(req.body);
+    if (!parsed.ok) {
+      return res.status(400).json({ error: '返修判定请求非法，未修改', errors: parsed.errors });
+    }
+    const it = parsed.item;
+    try {
+      const done = db.transaction(() => {
+        const batch = resolveBatch(db, p.id, req.params.bid, 'base');
+        const targetBatch = resolveBatch(db, p.id, it.target_batch_id, 'target');
+        const commentId = toReworkIntId(req.params.cid);
+        const row = commentId !== null ? getReworkComment(db, batch.id, commentId) : null;
+        if (!row) {
+          throw new ReworkError(404, {
+            error: `返修意见 ${req.params.cid} 在批次 ${batch.id} 中不存在，未修改`,
+          });
+        }
+        const currentState = () => ({
+          comment: reworkCommentStateView(db, getReworkComment(db, batch.id, row.id)),
+        });
+        if (it.version !== row.version) {
+          throw new ReworkError(409, {
+            error: `意见版本过期：你基于 v${it.version} 判定，当前已是 v${row.version}，请刷新后重试`,
+            current: currentState(),
+          });
+        }
+        // 事务内重新核对（只读两份冻结文件）：只有“待人工确认”才允许判定
+        const inspect = inspectCommentFiles(db, batch, targetBatch, row);
+        if (inspect.problems.length > 0) {
+          throw new ReworkError(500, {
+            error: `返修意见 ${row.id} 的核对因快照问题失败：清单所指文件缺失或快照损坏，未修改`,
+            batch_id: batch.id,
+            target_id: targetBatch.id,
+            snapshot_problems: inspect.problems,
+          });
+        }
+        const evaluation = evaluateComment(row, inspect.baseCues, inspect.targetFile, inspect.targetCues);
+        if (evaluation.status !== 'pending') {
+          throw new ReworkError(422, {
+            error:
+              `返修意见 ${row.id} 对目标批次 ${targetBatch.id} 的核对结果为` +
+              `「${evaluation.status_label}」，只有「待人工确认」才能判定，未修改`,
+            current: { ...currentState(), check: evaluation },
+          });
+        }
+        // 写入结论（绑定目标批次；同批重复判定覆盖结论），并推进意见版本
+        db.prepare(
+          `INSERT INTO rework_verdicts (comment_id, target_batch_id, verdict)
+           VALUES (?, ?, ?)
+           ON CONFLICT(comment_id, target_batch_id)
+           DO UPDATE SET verdict = excluded.verdict, updated_at = datetime('now')`
+        ).run(row.id, targetBatch.id, it.verdict);
+        const upd = db.prepare(
+          `UPDATE rework_comments SET version = version + 1, updated_at = datetime('now')
+            WHERE id = ? AND version = ?`
+        ).run(row.id, it.version);
+        if (upd.changes !== 1) {
+          throw new ReworkError(409, {
+            error: `返修意见 ${row.id} 在判定瞬间发生变化，请刷新后重试`,
+            current: currentState(),
+          });
+        }
+        return { batch, targetBatch, row, evaluation };
+      })();
+      const updated = getReworkComment(db, done.batch.id, done.row.id);
+      res.json({
+        project_id: p.id,
+        batch: reworkBatchSummary(done.batch),
+        target: reworkBatchSummary(done.targetBatch),
+        comment: commentCheckItem(db, updated, done.evaluation, done.targetBatch.id),
+      });
+    } catch (err) {
+      if (err instanceof ReworkError) return res.status(err.statusCode).json(err.payload);
+      throw err;
+    }
   });
 
   // ---------- 逐词区间复核意见（校对页） ----------
